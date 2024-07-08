@@ -7,34 +7,44 @@ import rasterio
 
 file_path = 'data/forests/v1/models/data/images/2017_WLOU_1_NEON_D13_WLOU_DP3_419000_4416000_CHM.tif'
 
-image = Image.open('data/forests/v1/models/data/images/2017_WLOU_1_NEON_D13_WLOU_DP3_419000_4416000_CHM.tif')
+def visualise_chm(file_path):
+    with rasterio.open(file_path) as src:
+        # Read the data from the first band
+        chm_data = src.read(1)
 
-image_array = np.array(image)
+        # Plotting the CHM data
+        plt.figure(figsize=(10, 10))
+        plt.imshow(chm_data, cmap='viridis')  # Viridis is a good colormap for continuous data
+        plt.colorbar(label='Canopy Height (m)')
+        plt.title('Canopy Height Model (CHM)')
+        plt.xlabel('Pixel X Coordinate')
+        plt.ylabel('Pixel Y Coordinate')
 
-print("Image array shape:", image_array.shape)
+        # Save the plot as a PNG file
+        plt.savefig('CHM_Visualization.png')
+        plt.close()
 
-print("mean: ", np.mean(image_array))
-print("max: ",image_array.max())
-print("min: ",image_array.min())
-print("standard dev: ",np.std(image_array))
-print("median: ",np.median(image_array))
+def visualise_rbg_images(file_path, normalised='True'):
 
-image_array = np.reshape(image_array, (image_array.shape[0], image_array.shape[1], 1))
+    image = Image.open(file_path)
+    image_array = np.array(image)
 
-print(image_array.shape)
+    if normalised:
+        image_array = image_array/255
+        image = Image.fromarray((image_array * 255).astype(np.uint8))
 
-with rasterio.open(file_path) as src:
-    # Read the data from the first band
-    chm_data = src.read(1)
+    image.save('RGB_Visualistion.png')
 
-    # Plotting the CHM data
-    plt.figure(figsize=(10, 10))
-    plt.imshow(chm_data, cmap='viridis')  # Viridis is a good colormap for continuous data
-    plt.colorbar(label='Canopy Height (m)')
-    plt.title('Canopy Height Model (CHM)')
-    plt.xlabel('Pixel X Coordinate')
-    plt.ylabel('Pixel Y Coordinate')
+def analyse_statistics(file_path):
+    image = Image.open(file_path)
+    image_array = np.array(image)
 
-    # Save the plot as a PNG file
-    plt.savefig('CHM_Visualization.png')
-    plt.close()
+    print("Image array shape:", image_array.shape)
+
+    print("mean: ", np.mean(image_array))
+    print("max: ",image_array.max())
+    print("min: ",image_array.min())
+    print("standard dev: ",np.std(image_array))
+    print("median: ",np.median(image_array))
+    
+
