@@ -79,9 +79,9 @@ class SSLModule(pl.LightningModule):
         return x
 
 class NeonDataset(torch.utils.data.Dataset):
-    path = './data/images/'
+    path = './data/forests/v1/models/data/images/'
     root_dir = Path(path)
-    df_path = './data/neon_test_data.csv'
+    df_path = './data/forests/v1/models/data/neon_test_data.csv'
     
     def __init__(self, model_norm, new_norm, src_img='maxar', 
                  trained_rgb= False, no_norm = False,
@@ -144,6 +144,30 @@ class NeonDataset(torch.utils.data.Dataset):
                 'lat':torch.Tensor([l.lat]).nan_to_num(0),
                 'lon':torch.Tensor([l.lon]).nan_to_num(0),
                }
+
+class MurreeBioDiversityParkDataset:
+    def __init__(self, root_dir):
+        self.root_dir = root_dir
+        self.tif_files = self._get_tif_files()
+
+    def _get_tif_files(self):
+        tif_files = []
+        target_dir = os.path.join(self.root_dir, '3_dsm_ortho', '2_mosaic', 'tiles')
+        for root, _, files in os.walk(target_dir):
+            for file in files:
+                if file.endswith('.tif'):
+                    tif_files.append(os.path.join(root, file))
+        return tif_files
+
+    def __len__(self):
+        return len(self.tif_files)
+
+    def __getitem__(self, idx):
+        if idx < 0 or idx >= len(self.tif_files):
+            raise IndexError("Index out of range")
+        tif_path = self.tif_files[idx]
+        image = Image.open(tif_path)
+        return image
 
 def evaluate(model, 
              norm, 
