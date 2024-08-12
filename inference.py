@@ -25,6 +25,10 @@ from models.dpt_head import DPTHead
 import pytorch_lightning as pl
 from models.regressor import RNet
 
+import rasterio
+from rasterio.windows import Window
+import torch
+
 class SSLAE(nn.Module):
     def __init__(self, pretrained=None, classify=True, n_bins=256, huge=False):
         super().__init__()
@@ -127,6 +131,7 @@ class NeonDataset(torch.utils.data.Dataset):
                         p5I = [norm_img[0][0].item(), norm_img[0][1].item(), norm_img[0][2].item()]
                         p95I = [norm_img[0][3].item(), norm_img[0][4].item(), norm_img[0][5].item()]
                     else:
+                        s = 1092
                         # apply image normalization to aerial images, matching color intensity of maxar images
                         I = TF.to_tensor(Image.open(self.root_dir / l['maxar']).crop((x, y, x+s, y+s))) 
                         p5I = [np.percentile(I[i,:,:].flatten(),5) for i in range(3)]
@@ -146,28 +151,269 @@ class NeonDataset(torch.utils.data.Dataset):
                }
 
 class MurreeBioDiversityParkDataset:
-    def __init__(self, root_dir):
-        self.root_dir = root_dir
-        self.tif_files = self._get_tif_files()
+    path = './Murree_data/3_dsm_ortho/2_mosaic/tiles/'
+    root_dir = Path(path)
+    df_path = './Murree_data/3_dsm_ortho/2_mosaic/murree_data.csv'
 
-    def _get_tif_files(self):
-        tif_files = []
-        target_dir = os.path.join(self.root_dir, '3_dsm_ortho', '2_mosaic', 'tiles')
-        for root, _, files in os.walk(target_dir):
-            for file in files:
-                if file.endswith('.tif'):
-                    tif_files.append(os.path.join(root, file))
-        return tif_files
+    def __init__(self, model_norm, new_norm, src_img='tif_file',
+                 trained_rgb= False, no_norm = False,
+                **kwargs):
+       
+        self.no_norm = no_norm
+        self.model_norm = model_norm
+        self.new_norm = new_norm
+        self.trained_rgb = trained_rgb
+        self.size = 256
+        self.df = pd.read_csv(self.df_path, index_col=0)
+        self.src_img = src_img
+        
+        # number of times crops can be used horizontally
+        self.size_multiplier = 6
 
     def __len__(self):
-        return len(self.tif_files)
+        return len(self.df)
 
-    def __getitem__(self, idx):
-        if idx < 0 or idx >= len(self.tif_files):
-            raise IndexError("Index out of range")
-        tif_path = self.tif_files[idx]
-        image = Image.open(tif_path)
-        return image
+    def __getitem__(self, i):      
+        n = self.size_multiplier 
+        ix, jx, jy = i//(n**2), (i%(n**2))// n, (i% (n**2)) % n 
+        if self.src_img == 'tif_file':
+            l = self.df.iloc[ix]
+        x = list(range(l.bord_x, l.imsize_x-l.bord_x-self.size, self.size))[jx]
+        y = list(range(l.bord_y, l.imsize_y-l.bord_y-self.size, self.size))[jy]
+        print("X:", x, "Y:", y)
+        img = TF.to_tensor(Image.open(self.root_dir / l[self.src_img]).crop((x, y, x+self.size, y+self.size)))[:3,:,:]
+        
+        if not self.trained_rgb:
+            if self.src_img == 'tif_file':
+                if self.no_norm:
+                    normIn = img
+                else:
+                    if self.new_norm:
+                        # image image normalization using learned quantiles of pairs of Maxar/Neon images
+                        x = torch.unsqueeze(img, dim=0)
+                        norm_img = self.model_norm(x).detach()
+                        p5I = [norm_img[0][0].item(), norm_img[0][1].item(), norm_img[0][2].item()]
+                        p95I = [norm_img[0][3].item(), norm_img[0][4].item(), norm_img[0][5].item()]
+                    else:
+                        s = 1092
+                        # apply image normalization to aerial images, matching color intensity of maxar images
+                        I = TF.to_tensor(Image.open(self.root_dir / l['maxar']).crop((x, y, x+s, y+s))) 
+                        p5I = [np.percentile(I[i,:,:].flatten(),5) for i in range(3)]
+                        p95I = [np.percentile(I[i,:,:].flatten(),95) for i in range(3)]
+                    p5In = [np.percentile(img[i,:,:].flatten(),5) for i in range(3)]
+
+                    p95In = [np.percentile(img[i,:,:].flatten(),95) for i in range(3)]
+                    normIn = img.clone()
+                    for i in range(3):
+                        normIn[i,:,:] = (img[i,:,:]-p5In[i]) * ((p95I[i]-p5I[i])/(p95In[i]-p5In[i])) + p5I[i]
+                  
+        return {'img': normIn, 
+                'img_no_norm': img, 
+                'lat':torch.Tensor([l.lat]).nan_to_num(0),
+                'lon':torch.Tensor([l.lon]).nan_to_num(0),
+               }
+
+class prssDataset(torch.utils.data.Dataset):
+    path = './prss/images/'
+    root_dir = Path(path)
+    df_path = './prss/prssData.csv'
+
+    def __init__(self, model_norm, new_norm, src_img='ImageName',
+                    trained_rgb= False, no_norm = False,
+                    **kwargs):
+        
+        self.no_norm = no_norm
+        self.model_norm = model_norm
+        self.new_norm = new_norm
+        self.trained_rgb = trained_rgb
+        self.size = 256
+        self.df = pd.read_csv(self.df_path, index_col=0)
+        self.src_img = src_img
+        
+        # number of times crops can be used horizontally
+        self.size_multiplier = 6
+
+    def __len__(self):
+        return len(self.df)
+    
+    def read_and_crop_image_with_rasterio(self, file_path, x, y, size):
+        with rasterio.open(file_path) as src:
+            # Define the window to read based on the x, y coordinates and the desired size
+            window = Window(x, y, size, size)
+            # Read the data from the window for the first three bands (assuming RGB)
+            img_data = src.read([1, 2, 3], window=window)
+            
+            # Normalize data to 0-1 range if necessary, assuming data is 8-bit
+            img_data = img_data / 255.0
+
+            # Convert the numpy array to a PyTorch tensor
+            img_tensor = torch.tensor(img_data, dtype=torch.float32)
+            # Rearrange the dimensions to match what PyTorch expects: (channels, height, width)
+            img_tensor = img_tensor.permute(0, 1, 2)
+
+        return img_tensor
+
+    def __getitem__(self, i):
+        n = self.size_multiplier
+        ix, jx, jy = i//(n**2), (i%(n**2))// n, (i% (n**2)) % n
+        if self.src_img == 'ImageName':
+            l = self.df.iloc[ix]
+        x = list(range(l.bord_x, l.image_width-l.bord_x-self.size, self.size))[jx]
+        y = list(range(l.bord_y, l.image_height-l.bord_y-self.size, self.size))[jy]
+        # img = TF.to_tensor(Image.open(self.root_dir / l[self.src_img]).crop((x, y, x+self.size, y+self.size)))[:3,:,:]
+        print("ix:" ,ix)
+        print("jx: {}, jy: {}".format(jx, jy))
+        print("X:", x, "Y:", y)
+        file_path = self.root_dir / l[self.src_img]
+        img = self.read_and_crop_image_with_rasterio(file_path, x, y, self.size)
+        print("file_path: ", file_path)
+        print("image shape: ", img.shape)
+        print()
+
+        if not self.trained_rgb:
+            if self.src_img == 'ImageName':
+                if self.no_norm:
+                    normIn = img
+                else:
+                    if self.new_norm:
+                        # image image normalization using learned quantiles of pairs of Maxar/Neon images
+                        x = torch.unsqueeze(img, dim=0)
+                        norm_img = self.model_norm(x).detach()
+                        p5I = [norm_img[0][0].item(), norm_img[0][1].item(), norm_img[0][2].item()]
+                        p95I = [norm_img[0][3].item(), norm_img[0][4].item(), norm_img[0][5].item()]
+                    else:
+                        s = 1092
+                        # apply image normalization to aerial images, matching color intensity of maxar images
+                        I = TF.to_tensor(Image.open(self.root_dir / l['maxar']).crop((x, y, x+s, y+s)))
+                        p5I = [np.percentile(I[i,:,:].flatten(),5) for i in range(3)]
+                        p95I = [np.percentile(I[i,:,:].flatten(),95) for i in range(3)]
+                    p5In = [np.percentile(img[i,:,:].flatten(),5) for i in range(3)]
+
+                    p95In = [np.percentile(img[i,:,:].flatten(),95) for i in range(3)]
+                    normIn = img.clone()
+                    for i in range(3):
+                        normIn[i,:,:] = (img[i,:,:]-p5In[i]) * ((p95I[i]-p5I[i])/(p95In[i]-p5In[i])) + p5I[i]
+                  
+        return {'img': normIn, 
+                'img_no_norm': img, 
+                'lat':torch.Tensor([l.lat]).nan_to_num(0),
+                'lon':torch.Tensor([l.lon]).nan_to_num(0),
+            }
+
+# def evaluate(model, 
+#              norm, 
+#              model_norm,
+#              name, 
+#              bs=32, 
+#              trained_rgb=False,
+#              normtype=2,
+#              device = 'cuda:0', 
+#              no_norm = False, 
+#              display = False):
+      
+#     dataset_key = 'neon_aerial'
+    
+#     print("normtype", normtype)    
+    
+#     # choice of the normalization of aerial images. 
+#     # i- For inference on satellite images args.normtype should be set to 0; 
+#     # ii- For inference on aerial images, if corresponding Maxar quantiles at the
+#     # same coordinates are known, args.normtype should be set to 1;
+#     # iii- For inference on aerial images, an automatic normalization using a pretrained
+#     # network on aerial and satellite images on Neon can be used: args.normtype should be set to 2 (default); 
+    
+#     new_norm=True
+#     no_norm=False
+#     if normtype == 0:
+#         no_norm=True
+#     elif normtype == 1:
+#         new_norm=False
+#     elif normtype == 2:
+#         new_norm=True
+    
+#     ds = NeonDataset( model_norm, new_norm, domain='test', src_img='neon', trained_rgb=trained_rgb, no_norm=no_norm)
+#     dataloader = torch.utils.data.DataLoader(ds, batch_size=bs, shuffle=True, num_workers=10)
+        
+#     Path('../reports').joinpath(name).mkdir(parents=True, exist_ok=True)
+#     Path('../reports/'+name).joinpath('results_for_fig_'+dataset_key).mkdir(parents=True, exist_ok=True)
+#     metrics = {}
+
+#     # canopy height metrics
+#     metric_classes = dict(
+#         mae = torchmetrics.MeanAbsoluteError(),
+#         rmse = torchmetrics.MeanSquaredError(squared= False),
+#         r2 = torchmetrics.R2Score(),
+#         r2_block = torchmetrics.R2Score())
+        
+#     downsampler = nn.AvgPool2d(50)
+#     bd = 3
+    
+#     preds, chms = [], []
+#     chm_block_means, pred_block_means = [], []
+    
+#     fig_batch_ind = 0
+
+#     for batch in tqdm(dataloader):
+#         chm = batch['chm'].detach()
+#         batch = {k:v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+#         pred = model(norm(batch['img']))
+#         pred = pred.cpu().detach().relu()
+        
+#         if display == True:
+#             # display Predicted CHM
+#             for ind in range(pred.shape[0]):     
+#                 fig, ax = plt.subplots(nrows=1, ncols=4, figsize=(20, 5))
+#                 plt.subplots_adjust(hspace=0.5)
+#                 img_no_norm = batch['img_no_norm'][ind].cpu()
+#                 Inn = np.moveaxis(img_no_norm.numpy(), 0, 2)
+#                 img = batch['img'][ind].cpu()
+#                 I = np.moveaxis(img.numpy(), 0, 2)
+#                 gt = batch['chm'][ind].cpu()
+#                 GT = np.moveaxis(gt.numpy(), 0, 2)
+#                 ax[0].imshow(Inn)
+#                 ax[0].set_title(f"Image",fontsize=12)
+#                 ax[0].set_xlabel('meters')
+#                 ax[1].imshow(I)
+#                 ax[1].set_title(f"Normalized Image ",fontsize=12)
+#                 ax[1].set_xlabel('meters')
+#                 combined_data = np.concatenate((batch['chm'][ind].cpu().numpy(), pred[ind].detach().numpy()), axis=0)
+#                 _min, _max = np.amin(combined_data), np.amax(combined_data)
+#                 pltim = ax[2].imshow(pred[ind][0].detach().numpy(), vmin = _min, vmax = _max)
+#                 ax[2].set_title(f"Pred CHM",fontsize=12)
+#                 ax[2].set_xlabel('meters')
+#                 pltim = ax[3].imshow(GT, vmin = _min, vmax = _max)
+#                 ax[3].set_title(f"GT CHM",fontsize=12)
+#                 ax[3].set_xlabel('meters') 
+#                 cax = fig.add_axes([0.95, 0.15, 0.02, 0.7])
+#                 fig.colorbar(pltim, cax=cax, orientation="vertical")
+#                 cax.set_title("meters", fontsize=12) 
+#                 plt.savefig(f"{name}/fig_{fig_batch_ind}_{ind}_{normtype}.png", dpi=300)
+            
+#             fig_batch_ind = fig_batch_ind + 1
+        
+#         chm_block_mean = downsampler(chm[..., bd:, bd:])
+#         pred_block_mean = downsampler(pred[..., bd:, bd:])
+        
+#         metric_classes['mae'].update(pred, chm)
+#         metric_classes['rmse'].update(pred, chm)
+#         metric_classes['r2'].update(pred.flatten(), chm.flatten())
+#         metric_classes['r2_block'].update(pred_block_mean.flatten(), chm_block_mean.flatten())
+    
+#         preds.append(pred), chms.append(chm)
+#         chm_block_means.append(chm_block_mean)
+#         pred_block_means.append(pred_block_mean)
+#         if display:
+#             break
+#     preds, chms = torch.cat(preds), torch.cat(chms)
+    
+#     metrics = {k:v.compute() for k, v in metric_classes.items()}
+#     torch.save(metrics, f'{name}/metrics.pt')
+
+#     #print metrics
+#     for k, v in metrics.items():
+#         print(f'{k} {v.item():.2f}')
+#     print(f"Bias: {(preds.flatten()-chms.flatten()).numpy().mean():.2f}")
+
 
 def evaluate(model, 
              norm, 
@@ -176,112 +422,79 @@ def evaluate(model,
              bs=32, 
              trained_rgb=False,
              normtype=2,
-             device = 'cuda:0', 
-             no_norm = False, 
-             display = False):
-      
+             device='cuda:0', 
+             no_norm=False, 
+             display=False):
+    
     dataset_key = 'neon_aerial'
+    print("normtype", normtype)
     
-    print("normtype", normtype)    
-    
-    # choice of the normalization of aerial images. 
-    # i- For inference on satellite images args.normtype should be set to 0; 
-    # ii- For inference on aerial images, if corresponding Maxar quantiles at the
-    # same coordinates are known, args.normtype should be set to 1;
-    # iii- For inference on aerial images, an automatic normalization using a pretrained
-    # network on aerial and satellite images on Neon can be used: args.normtype should be set to 2 (default); 
-    
-    new_norm=True
-    no_norm=False
+    new_norm = True
+    no_norm = False
     if normtype == 0:
-        no_norm=True
+        no_norm = True
     elif normtype == 1:
-        new_norm=False
+        new_norm = False
     elif normtype == 2:
-        new_norm=True
+        new_norm = True
     
-    ds = NeonDataset( model_norm, new_norm, domain='test', src_img='neon', trained_rgb=trained_rgb, no_norm=no_norm)
+    # ds = MurreeBioDiversityParkDataset(model_norm, new_norm, domain='test', src_img='tif_file', trained_rgb=trained_rgb, no_norm=no_norm)
+    ds = prssDataset(model_norm, new_norm, domain='test', src_img='ImageName', trained_rgb=trained_rgb, no_norm=no_norm)
     dataloader = torch.utils.data.DataLoader(ds, batch_size=bs, shuffle=True, num_workers=10)
-        
-    Path('../reports').joinpath(name).mkdir(parents=True, exist_ok=True)
-    Path('../reports/'+name).joinpath('results_for_fig_'+dataset_key).mkdir(parents=True, exist_ok=True)
-    metrics = {}
-
-    # canopy height metrics
-    metric_classes = dict(
-        mae = torchmetrics.MeanAbsoluteError(),
-        rmse = torchmetrics.MeanSquaredError(squared= False),
-        r2 = torchmetrics.R2Score(),
-        r2_block = torchmetrics.R2Score())
-        
-    downsampler = nn.AvgPool2d(50)
-    bd = 3
     
-    preds, chms = [], []
-    chm_block_means, pred_block_means = [], []
+    Path('../reports').joinpath(name).mkdir(parents=True, exist_ok=True)
+    Path('../reports/' + name).joinpath('results_for_fig_' + dataset_key).mkdir(parents=True, exist_ok=True)
     
     fig_batch_ind = 0
 
+    print("Starting evaluation and plotting...")
+
     for batch in tqdm(dataloader):
-        chm = batch['chm'].detach()
-        batch = {k:v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+
+        print("Processing batch...")
+
+        batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
         pred = model(norm(batch['img']))
         pred = pred.cpu().detach().relu()
         
-        if display == True:
-            # display Predicted CHM
-            for ind in range(pred.shape[0]):     
+        if display:
+            for ind in range(pred.shape[0]):
                 fig, ax = plt.subplots(nrows=1, ncols=4, figsize=(20, 5))
                 plt.subplots_adjust(hspace=0.5)
                 img_no_norm = batch['img_no_norm'][ind].cpu()
                 Inn = np.moveaxis(img_no_norm.numpy(), 0, 2)
                 img = batch['img'][ind].cpu()
                 I = np.moveaxis(img.numpy(), 0, 2)
-                gt = batch['chm'][ind].cpu()
-                GT = np.moveaxis(gt.numpy(), 0, 2)
+                # gt = batch['chm'][ind].cpu()
+                # GT = np.moveaxis(gt.numpy(), 0, 2)
                 ax[0].imshow(Inn)
-                ax[0].set_title(f"Image",fontsize=12)
+                ax[0].set_title("Image", fontsize=12)
                 ax[0].set_xlabel('meters')
                 ax[1].imshow(I)
-                ax[1].set_title(f"Normalized Image ",fontsize=12)
+                ax[1].set_title("Normalized Image", fontsize=12)
                 ax[1].set_xlabel('meters')
-                combined_data = np.concatenate((batch['chm'][ind].cpu().numpy(), pred[ind].detach().numpy()), axis=0)
-                _min, _max = np.amin(combined_data), np.amax(combined_data)
-                pltim = ax[2].imshow(pred[ind][0].detach().numpy(), vmin = _min, vmax = _max)
-                ax[2].set_title(f"Pred CHM",fontsize=12)
+
+                # combined_data = np.concatenate((batch['chm'][ind].cpu().numpy(), pred[ind].detach().numpy()), axis=0)
+                # _min, _max = np.amin(combined_data), np.amax(combined_data)
+
+                pred_numpy = pred[ind].detach().numpy()
+                _min, _max = np.amin(pred_numpy), np.amax(pred_numpy)
+
+                pltim = ax[2].imshow(pred[ind][0].detach().numpy(), vmin=_min, vmax=_max)
+                ax[2].set_title("Pred CHM", fontsize=12)
                 ax[2].set_xlabel('meters')
-                pltim = ax[3].imshow(GT, vmin = _min, vmax = _max)
-                ax[3].set_title(f"GT CHM",fontsize=12)
-                ax[3].set_xlabel('meters') 
+                # pltim = ax[3].imshow(GT, vmin=_min, vmax=_max)
+                # ax[3].set_title("GT CHM", fontsize=12)
+                # ax[3].set_xlabel('meters')
                 cax = fig.add_axes([0.95, 0.15, 0.02, 0.7])
                 fig.colorbar(pltim, cax=cax, orientation="vertical")
-                cax.set_title("meters", fontsize=12) 
+                cax.set_title("meters", fontsize=12)
                 plt.savefig(f"{name}/fig_{fig_batch_ind}_{ind}_{normtype}.png", dpi=300)
             
-            fig_batch_ind = fig_batch_ind + 1
-        
-        chm_block_mean = downsampler(chm[..., bd:, bd:])
-        pred_block_mean = downsampler(pred[..., bd:, bd:])
-        
-        metric_classes['mae'].update(pred, chm)
-        metric_classes['rmse'].update(pred, chm)
-        metric_classes['r2'].update(pred.flatten(), chm.flatten())
-        metric_classes['r2_block'].update(pred_block_mean.flatten(), chm_block_mean.flatten())
-    
-        preds.append(pred), chms.append(chm)
-        chm_block_means.append(chm_block_mean)
-        pred_block_means.append(pred_block_mean)
-        if display:
-            break
-    preds, chms = torch.cat(preds), torch.cat(chms)
-    
-    metrics = {k:v.compute() for k, v in metric_classes.items()}
-    torch.save(metrics, f'{name}/metrics.pt')
+            fig_batch_ind += 1
+            break  # Remove this line if you want to process all batches
 
-    #print metrics
-    for k, v in metrics.items():
-        print(f'{k} {v.item():.2f}')
-    print(f"Bias: {(preds.flatten()-chms.flatten()).numpy().mean():.2f}")
+    print("Evaluation and plotting completed.")
     
 
 def parse_args():
@@ -332,6 +545,7 @@ def main():
     
     # 4- evaluation 
     evaluate(model, norm, model_norm, name=args.name, bs=16, trained_rgb=args.trained_rgb, normtype=args.normtype, device=device, display=args.display)
+
 
 if __name__ == '__main__':
     main()
