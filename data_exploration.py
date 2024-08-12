@@ -48,3 +48,7 @@ def analyse_statistics(file_path):
     print("median: ",np.median(image_array))
     
 
+# analyse_statistics("Murree_data/MurreeData/2_mosaic/tiles/Biodiversity_park_murree_transparent_mosaic_group1_1_1.tif")
+# visualise_rbg_images("Murree_data/MurreeData/2_mosaic/tiles/Biodiversity_park_murree_transparent_mosaic_group1_1_1.tif")
+visualise_rbg_images('Murree_data/3_dsm_ortho/2_mosaic/tiles/Biodiversity_park_murree_transparent_mosaic_group1_3_4.tif')
+analyse_statistics('Murree_data/3_dsm_ortho/2_mosaic/tiles/Biodiversity_park_murree_transparent_mosaic_group1_3_4.tif')
